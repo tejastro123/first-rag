@@ -7,6 +7,15 @@ Routes:
   POST /api/v1/query               — Standard RAG query (protected)
   POST /api/v1/query/stream        — Streaming RAG query via SSE (protected)
   DELETE /api/v1/session/{id}      — Clear a session's conversation history
+
+  ContractIQ — Phase 1
+  POST /api/v1/contracts/analyze      — Risk analysis: score + flagged clauses
+
+  ContractIQ — Phase 2
+  POST /api/v1/contracts/compare      — Contract diff: added / removed / modified clauses
+
+  ContractIQ — Phase 3
+  POST /api/v1/contracts/obligations  — Obligation registry: deadlines, duties, penalties
 """
 import time
 import json
@@ -26,6 +35,9 @@ from app.schemas import (
     QueryRequest, QueryResponse,
     TokenRequest, TokenResponse,
     IngestResponse, SessionCreateResponse,
+    AnalyzeRequest, ContractAnalysis,
+    CompareRequest, ComparisonResult,
+    ObligationsRequest, ObligationRegistry,
 )
 from app.services.retriever import AdvancedRetriever
 from app.services.generator import GenerationService
@@ -36,6 +48,9 @@ from app.services.auth import (
 )
 from app.services import session_manager
 from app.services.ingestion import ingest_file
+from app.services.risk_analysis import RiskAnalysisService
+from app.services.comparison import ComparisonService
+from app.services.obligation_extractor import ObligationExtractor
 from app.config import get_settings
 
 settings = get_settings()
@@ -90,6 +105,15 @@ def get_retriever() -> AdvancedRetriever:
 
 def get_generator() -> GenerationService:
     return GenerationService()
+
+def get_risk_analysis_service() -> RiskAnalysisService:
+    return RiskAnalysisService()
+
+def get_comparison_service() -> ComparisonService:
+    return ComparisonService()
+
+def get_obligation_extractor() -> ObligationExtractor:
+    return ObligationExtractor()
 
 # ---------------------------------------------------------------------------
 # Auth Routes
@@ -306,6 +330,149 @@ async def clear_session(
     session_manager.delete_session(session_id)
     logger.info(f"Session {session_id} cleared by user '{current_user}'.")
     return {"status": "cleared", "session_id": session_id}
+
+# ---------------------------------------------------------------------------
+# ContractIQ — Phase 1: Contract Analysis Routes
+# ---------------------------------------------------------------------------
+@app.post(
+    "/api/v1/contracts/analyze",
+    response_model=ContractAnalysis,
+    tags=["ContractIQ"],
+    summary="Analyse contract risk — score + flagged clauses",
+)
+@limiter.limit("5/minute")
+async def analyze_contract(
+    request: Request,
+    body: AnalyzeRequest,
+    service: RiskAnalysisService = Depends(get_risk_analysis_service),
+    current_user: str = Depends(get_current_user),
+):
+    """
+    ContractIQ Risk Analysis Pipeline (Phase 1):
+    1. Retrieve all chunks for the specified document from Qdrant
+    2. Build structured contract context
+    3. Run Cohere command-a with JSON-schema enforcement
+    4. Parse + validate each flagged clause into a `RiskClause`
+    5. Compute aggregate risk score and return `ContractAnalysis`
+
+    **document_id** must match a filename previously ingested via `POST /api/v1/ingest`.
+    """
+    logger.info(
+        f"ContractIQ: user='{current_user}' requesting analysis of '{body.document_id}' "
+        f"(focus='{body.focus_area or 'general'}')"
+    )
+    try:
+        result = await service.analyze(
+            document_id=body.document_id,
+            focus_area=body.focus_area,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.error(f"ContractIQ analysis failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(exc)}")
+
+    return result
+
+# ---------------------------------------------------------------------------
+# ContractIQ — Phase 2: Contract Comparison Routes
+# ---------------------------------------------------------------------------
+@app.post(
+    "/api/v1/contracts/compare",
+    response_model=ComparisonResult,
+    tags=["ContractIQ"],
+    summary="Compare two contracts — side-by-side diff with delta scoring",
+)
+@limiter.limit("3/minute")
+async def compare_contracts(
+    request: Request,
+    body: CompareRequest,
+    service: ComparisonService = Depends(get_comparison_service),
+    current_user: str = Depends(get_current_user),
+):
+    """
+    ContractIQ Contract Comparison Pipeline (Phase 2):
+    1. Dual-parallel retrieval: fetch all chunks from document A and B simultaneously
+    2. Build a side-by-side context block for the LLM
+    3. Run Cohere command-a with strict JSON delta-detection schema
+    4. Parse each difference into a typed `ClauseDelta` (added / removed / modified)
+    5. Compute overall risk-shift score and direction
+    6. Return a `ComparisonResult`
+
+    Both **document_a** and **document_b** must have been previously ingested
+    via `POST /api/v1/ingest`.
+    """
+    if body.document_a == body.document_b:
+        raise HTTPException(
+            status_code=400,
+            detail="document_a and document_b must be different filenames."
+        )
+
+    logger.info(
+        f"ContractIQ compare: user='{current_user}' | "
+        f"'{body.document_a}' ↔ '{body.document_b}' "
+        f"(focus='{body.focus_area or 'general'}')"
+    )
+    try:
+        result = await service.compare(
+            document_a=body.document_a,
+            document_b=body.document_b,
+            focus_area=body.focus_area,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.error(f"ContractIQ comparison failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Comparison failed: {str(exc)}")
+
+    return result
+
+# ---------------------------------------------------------------------------
+# ContractIQ — Phase 3: Obligation Extractor Routes
+# ---------------------------------------------------------------------------
+@app.post(
+    "/api/v1/contracts/obligations",
+    response_model=ObligationRegistry,
+    tags=["ContractIQ"],
+    summary="Extract obligation registry — deadlines, duties, and penalties",
+)
+@limiter.limit("4/minute")
+async def extract_obligations(
+    request: Request,
+    body: ObligationsRequest,
+    service: ObligationExtractor = Depends(get_obligation_extractor),
+    current_user: str = Depends(get_current_user),
+):
+    """
+    ContractIQ Obligation Extraction Pipeline (Phase 3):
+    1. Retrieve all chunks for the specified document from Qdrant
+    2. Build deduplicated, ordered contract context
+    3. Run Cohere command-a with strict JSON obligation-extraction schema
+    4. Parse each obligation into a typed `Obligation` with party attribution,
+       due dates, priority, recurrence, and penalty clauses
+    5. Group by responsible party (party_a / party_b / shared)
+    6. Compute priority counts and identify the earliest deadline
+    7. Return a fully-typed `ObligationRegistry`
+
+    **document_id** must match a filename previously ingested via `POST /api/v1/ingest`.
+    """
+    logger.info(
+        f"ContractIQ obligations: user='{current_user}' | doc='{body.document_id}' | "
+        f"parties: '{body.party_a_name}' vs '{body.party_b_name}'"
+    )
+    try:
+        result = await service.extract(
+            document_id=body.document_id,
+            party_a_name=body.party_a_name or "Party A",
+            party_b_name=body.party_b_name or "Party B",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.error(f"ContractIQ obligation extraction failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Extraction failed: {str(exc)}")
+
+    return result
 
 # ---------------------------------------------------------------------------
 # Application Runner
